@@ -961,8 +961,11 @@ Kabar gembira bagi seluruh siswa-siswi Muslim SMAN 1 Kolang kelas X dan XI! Pend
               <input type="file" id="galFileInput" accept="image/*" class="text-xs">
               <input type="text" id="galUrlInput" placeholder="Atau tempel URL gambar (opsional)" class="w-full px-3 py-2 border rounded-xl text-sm">
             </div>
-            <div id="galVideoWrap" class="hidden">
-              <input type="text" id="galVideoUrl" placeholder="Tempel Link YouTube (contoh: https://youtu.be/xxxx)" class="w-full px-3 py-2 border rounded-xl text-sm">
+            <div id="galVideoWrap" class="hidden space-y-2">
+              <label class="block text-xs font-semibold text-slate-600">Pilih video dari HP (unggah ke Cloudinary):</label>
+              <input type="file" id="galVideoFileInput" accept="video/*" class="text-xs">
+              <p class="text-[11px] text-slate-500">Atau tempel link YouTube:</p>
+              <input type="text" id="galVideoUrl" placeholder="https://youtu.be/xxxx" class="w-full px-3 py-2 border rounded-xl text-sm">
             </div>
             <input type="text" id="galTanggal" placeholder="Tanggal / Keterangan (misal: November 2026)" class="w-full px-3 py-2 border rounded-xl text-sm">
             <button onclick="addGaleriItem()" class="bg-rohis-green text-white font-bold px-4 py-2 rounded-xl text-xs">Tambahkan ke Galeri</button>
@@ -1496,6 +1499,10 @@ Kabar gembira bagi seluruh siswa-siswi Muslim SMAN 1 Kolang kelas X dan XI! Pend
     window.rohisAuth = null;
     window.rohisDb = null;
     window.rohisPendaftarUnsubscribe = null;
+    window.rohisContentUnsubscribe = null;
+    window.rohisContentReady = false;
+    window.rohisApplyingRemote = false;
+    window.ROHIS_ADMIN_UID = "jGMEakZWzDOxtn245MERoUgjJBn1";
     try {
       const cfg = window.ROHIS_FIREBASE_CONFIG;
       if (cfg.apiKey !== "ISI_API_KEY" && cfg.projectId !== "ISI_PROJECT_ID") {
@@ -1521,15 +1528,157 @@ Kabar gembira bagi seluruh siswa-siswi Muslim SMAN 1 Kolang kelas X dan XI! Pend
     let activeGaleriFilter = "Semua";
     if (window.rohisFirebaseReady) {
       window.rohisAuth.onAuthStateChanged(user => {
-        if (user) startPendaftarRealtime();
+        // Konten publik harus dimuat juga oleh pengunjung yang belum login.
+        startContentRealtime();
+        if (user) {
+          startPendaftarRealtime();
+        } else if (window.rohisPendaftarUnsubscribe) {
+          window.rohisPendaftarUnsubscribe();
+          window.rohisPendaftarUnsubscribe = null;
+        }
       });
     }
 
+    // Hanya konten organisasi yang disimpan pada dokumen publik.
+    // PIN lokal dan data pendaftar tidak pernah dikirim ke dokumen ini.
+    function buildPublicContent() {
+      const data = JSON.parse(JSON.stringify(appData));
+      delete data.pins;
+      delete data.pendaftar;
+      return data;
+    }
+
+    function dataUrlToBlob(dataUrl) {
+      const parts = dataUrl.split(",");
+      const mime = (parts[0].match(/:(.*?);/) || [])[1] || "image/jpeg";
+      const binary = atob(parts[1]);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Blob([bytes], { type: mime });
+    }
+
+    // Cloudinary menyimpan media; Firestore tetap menjadi sumber data bersama.
+    const ROHIS_CLOUDINARY_CLOUD_NAME = "mekza6nd";
+    const ROHIS_CLOUDINARY_UPLOAD_PRESET = "rohis_upload";
+
+    async function uploadGalleryFile(file, title) {
+      if (!window.rohisAuth || !window.rohisAuth.currentUser ||
+          window.rohisAuth.currentUser.uid !== window.ROHIS_ADMIN_UID) {
+        throw new Error("Silakan masuk sebagai Admin sebelum mengunggah media.");
+      }
+      if (!file) throw new Error("File media tidak ditemukan.");
+      const resourceType = file.type && file.type.startsWith("video/") ? "video" : "image";
+      const endpoint = `https://api.cloudinary.com/v1_1/${ROHIS_CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`;
+      const form = new FormData();
+      form.append("file", file);
+      form.append("upload_preset", ROHIS_CLOUDINARY_UPLOAD_PRESET);
+      form.append("folder", "rohis");
+      const response = await fetch(endpoint, { method: "POST", body: form });
+      const result = await response.json();
+      if (!response.ok || !result.secure_url) {
+        throw new Error(result.error?.message || "Cloudinary gagal mengunggah media.");
+      }
+      return result.secure_url;
+    }
+
+    async function uploadGalleryDataUrl(dataUrl, title) {
+      const blob = dataUrlToBlob(dataUrl);
+      const file = new File([blob], `${String(title || "foto").replace(/[^a-z0-9_-]/gi, "_")}.jpg`, { type: blob.type || "image/jpeg" });
+      return await uploadGalleryFile(file, title);
+    }
+
+    async function contentReadyForCloud() {
+      const data = buildPublicContent();
+      const gallery = Array.isArray(data.galeri) ? data.galeri : [];
+      for (let i = 0; i < gallery.length; i++) {
+        const item = gallery[i];
+        if (item && typeof item.url === "string" && item.url.startsWith("data:")) {
+          const downloadUrl = await uploadGalleryDataUrl(item.url, item.judul);
+          gallery[i].url = downloadUrl;
+          if (appData.galeri[i]) appData.galeri[i].url = downloadUrl;
+        }
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+      return data;
+    }
+
+    function startContentRealtime() {
+      if (!window.rohisFirebaseReady) return;
+      if (window.rohisContentUnsubscribe) window.rohisContentUnsubscribe();
+
+      window.rohisContentUnsubscribe = window.rohisDb.collection("konten")
+        .doc("utama")
+        .onSnapshot(async doc => {
+          if (!doc.exists) {
+            // Migrasi awal: admin mengirim seluruh konten lokal yang sudah ada ke Firebase.
+            if (window.rohisAuth.currentUser &&
+                window.rohisAuth.currentUser.uid === window.ROHIS_ADMIN_UID) {
+              try {
+                const initialData = await contentReadyForCloud();
+                await window.rohisDb.collection("konten").doc("utama").set({
+                  data: initialData,
+                  updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                });
+                window.rohisContentReady = true;
+                renderAll();
+                if (currentRole) populateAdminForms();
+                alert("Konten awal berhasil dipindahkan ke Firebase.");
+              } catch (err) {
+                console.error("Gagal memindahkan konten awal:", err);
+                window.rohisContentReady = false;
+                alert("Konten belum berhasil dipindahkan. Pastikan Firestore Rules sudah dipasang dan koneksi internet tersedia.");
+              }
+            } else {
+              window.rohisContentReady = false;
+            }
+            return;
+          }
+
+          const remote = doc.data().data;
+          if (!remote || typeof remote !== "object") return;
+
+          window.rohisApplyingRemote = true;
+          try {
+            appData = { ...appData, ...remote };
+            if (!Array.isArray(appData.pendaftar)) appData.pendaftar = [];
+            if (!Array.isArray(appData.kelasOptions)) appData.kelasOptions = [...window.INITIAL_ROHIS_DATA.kelasOptions];
+            if (!Array.isArray(appData.bidangOptions)) appData.bidangOptions = [...window.INITIAL_ROHIS_DATA.bidangOptions];
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+            renderAll();
+            renderPendaftarAdmin();
+            if (typeof populateAdminForms === "function" && currentRole) populateAdminForms();
+          } finally {
+            window.rohisApplyingRemote = false;
+            window.rohisContentReady = true;
+          }
+        }, err => {
+          console.error("Gagal memuat konten online:", err);
+          window.rohisContentReady = false;
+        });
+    }
+
+    async function saveContentToCloud() {
+      if (!window.rohisFirebaseReady || !window.rohisContentReady ||
+          window.rohisApplyingRemote || !window.rohisAuth.currentUser) return;
+      if (window.rohisAuth.currentUser.uid !== window.ROHIS_ADMIN_UID) return;
+
+      try {
+        const data = await contentReadyForCloud();
+        await window.rohisDb.collection("konten").doc("utama").set({
+          data,
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+      } catch (err) {
+        console.error("Gagal menyimpan konten ke Firebase:", err);
+        alert("Perubahan belum berhasil disinkronkan. Pastikan koneksi internet dan pengaturan Cloudinary sudah benar.");
+      }
+    }
 
     function saveDataToLocal() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
       renderAll();
       renderPendaftarAdmin();
+      saveContentToCloud();
     }
 
     function applySectionOrder() {
@@ -2107,8 +2256,28 @@ Kabar gembira bagi seluruh siswa-siswi Muslim SMAN 1 Kolang kelas X dan XI! Pend
       if (!judul) return alert("Judul dokumentasi wajib diisi!");
 
       if (tipe === "Video") {
+        const videoInput = document.getElementById("galVideoFileInput");
+        const videoFile = videoInput && videoInput.files ? videoInput.files[0] : null;
         const url = document.getElementById("galVideoUrl").value.trim();
-        if (!url) return alert("Masukkan link YouTube!");
+        if (videoFile) {
+          (async () => {
+            try {
+              const uploadedUrl = await uploadGalleryFile(videoFile, judul);
+              appData.galeri.unshift({ tipe: "Video", judul, tanggal, url: uploadedUrl });
+              videoInput.value = "";
+              document.getElementById("galVideoUrl").value = "";
+              document.getElementById("galJudul").value = "";
+              saveDataToLocal();
+              populateAdminForms();
+              alert("Video berhasil diunggah dan disimpan.");
+            } catch (err) {
+              console.error("Upload video gagal:", err);
+              alert("Video belum berhasil diunggah: " + (err.message || "Periksa pengaturan Cloudinary."));
+            }
+          })();
+          return;
+        }
+        if (!url) return alert("Pilih video dari HP atau masukkan link YouTube!");
         appData.galeri.unshift({ tipe: "Video", judul, tanggal, url });
         document.getElementById("galVideoUrl").value = "";
         document.getElementById("galJudul").value = "";
@@ -2129,11 +2298,19 @@ Kabar gembira bagi seluruh siswa-siswi Muslim SMAN 1 Kolang kelas X dan XI! Pend
               canvas.height = img.height * scale;
               canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
               const compressedDataUrl = canvas.toDataURL("image/jpeg", 0.78);
-              appData.galeri.unshift({ tipe: "Foto", judul, tanggal, url: compressedDataUrl });
-              fileInput.value = "";
-              document.getElementById("galJudul").value = "";
-              saveDataToLocal();
-              populateAdminForms();
+              (async () => {
+                try {
+                  const url = await uploadGalleryDataUrl(compressedDataUrl, judul);
+                  appData.galeri.unshift({ tipe: "Foto", judul, tanggal, url });
+                  fileInput.value = "";
+                  document.getElementById("galJudul").value = "";
+                  saveDataToLocal();
+                  populateAdminForms();
+                } catch (err) {
+                  console.error("Upload foto galeri gagal:", err);
+                  alert("Foto belum berhasil diunggah ke Cloudinary. Periksa preset unsigned dan koneksi internet.");
+                }
+              })();
             };
             img.src = ev.target.result;
           };
